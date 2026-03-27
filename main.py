@@ -45,8 +45,12 @@ from modules.forest_inversion import ForestInversionApp
 from modules.structure_module import StructureModule
 # from modules.evaluation_module import QualityEvaluationWindow, SingleTreeQualityWindow
 from modules.stand_quality_qi_module import StandQualityWindow
-# from modules.structure_metrics_module import StructureMetricsWindow
 from modules.ui_style import apply_qt_app_style, apply_qt_window_baseline, QT_MAIN_SIZE
+
+try:
+    from modules.structure_metrics_module import StructureMetricsWindow
+except Exception:
+    StructureMetricsWindow = None
 
 try:
     from modules.individual_tree_quality_module import StructureMetricsWindow as IndividualTreeQualityWindow
@@ -558,11 +562,21 @@ class ForestMain(QMainWindow):
 
     def open_structure_metrics(self):
         if self.structure_metrics_window is None:
-            self.structure_metrics_window = StructureMetricsWindow(self.data_module, self)
+            if StructureMetricsWindow is None:
+                QMessageBox.critical(self, "错误", "林分结构参数分析模块加载失败，请检查 modules/structure_metrics_module.py 及其依赖。")
+                self.log_output.append("林分结构参数分析模块加载失败。")
+                return
+            try:
+                self.structure_metrics_window = StructureMetricsWindow(self.data_module, self)
+            except Exception as exc:
+                self.log_output.append(f"林分结构参数分析模块打开失败：{exc}")
+                QMessageBox.critical(self, "错误", f"林分结构参数分析模块打开失败：\n{exc}")
+                return
         self.structure_metrics_window.show()
         self.structure_metrics_window.raise_()
         self.structure_metrics_window.activateWindow()
         self.log_output.append("林分结构参数分析窗口已打开")
+
 
     def open_quality_window(self, key: str, title: str):
         window = self.quality_windows.get(key)

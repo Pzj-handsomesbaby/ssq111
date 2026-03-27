@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
 import math
 import os
 import re
-from typing import Optional, List, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Optional, List, Tuple
+
+import numpy as np
+import pandas as pd
 from scipy.spatial import KDTree
 
 # 补全丢失的导出路径类
@@ -559,4 +563,286 @@ def finite_mean(series) -> float:
     if values.empty:
         return float("nan")
     return float(values.mean())
+
+
+# ---------------------------------------------------------------------------
+# Column mapping: raw DataFrame → standard columns
+# ---------------------------------------------------------------------------
+
+_COLUMN_ALIASES: dict[str, list[str]] = {
+    "tree":    ["tree", "tag", "id", "树号", "编号", "treeid", "no"],
+    "species": ["species", "sp", "树种", "speciesname", "spname", "种"],
+    "dbh":     ["dbh", "d", "胸径", "径", "dbhcm", "d1.3", "d13", "d130"],
+    "height":  ["height", "h", "树高", "高", "ht"],
+    "crownd":  ["crowndiameter", "crdiameter", "cd", "冠径", "冠幅", "crownd", "crownwidth"],
+    "crownr":  ["crownradius", "cr", "冠半径", "冠幅半径", "crownr"],
+    "x":       ["x", "coordx", "lon", "xcoord", "east", "coordinatex", "横坐标"],
+    "y":       ["y", "coordy", "lat", "ycoord", "north", "coordinatey", "纵坐标"],
+}
+
+
+def _normalize_col(name) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(name or "").strip().lower())
+
+
+def map_to_standard(df: pd.DataFrame) -> pd.DataFrame:
+    """Map raw DataFrame columns to the standard schema:
+    Tree, X, Y, DBH, Species, Height, CrownRadius.
+
+    Supports named-column lookup (aliased) and positional fallback
+    (Plot/Tag/SP/D/H/CR/X/Y in columns 0-7).
+    """
+    norm_cols = [_normalize_col(c) for c in df.columns]
+
+    def find_col(key: str) -> int:
+        for alias in _COLUMN_ALIASES[key]:
+            for i, norm in enumerate(norm_cols):
+                if norm == alias:
+                    return i
+        return -1
+
+    i_tree = find_col("tree")
+    i_x    = find_col("x")
+    i_y    = find_col("y")
+    i_dbh  = find_col("dbh")
+    i_h    = find_col("height")
+    i_sp   = find_col("species")
+    i_cr   = find_col("crownr")
+    i_cd   = find_col("crownd")
+
+    has_required = i_tree >= 0 and i_x >= 0 and i_y >= 0 and i_dbh >= 0 and i_h >= 0
+
+    tree_enc = CategoryEncoder()
+    sp_enc   = CategoryEncoder()
+    result_rows: list[dict] = []
+
+    if has_required:
+        for _, row in df.iterrows():
+            tree_val = to_float(row.iloc[i_tree])
+            if not math.isfinite(tree_val):
+                tree_val = float(tree_enc.encode(str(row.iloc[i_tree] or "")))
+
+            x_val   = to_float(row.iloc[i_x])
+            y_val   = to_float(row.iloc[i_y])
+            dbh_val = to_float(row.iloc[i_dbh])
+            h_val   = to_float(row.iloc[i_h])
+
+            if not all(math.isfinite(v) for v in [x_val, y_val, dbh_val, h_val]):
+                continue
+
+            sp_val = to_float_or_category(row.iloc[i_sp], sp_enc) if i_sp >= 0 else 0.0
+
+            if i_cr >= 0:
+                crown_val = to_float(row.iloc[i_cr])
+            elif i_cd >= 0:
+                crown_val = to_float(row.iloc[i_cd])
+            else:
+                crown_val = float("nan")
+
+            if not math.isfinite(crown_val) or crown_val <= 0:
+                # Empirical fallback: ~30 % of tree height is a typical crown radius
+                crown_val = 0.3 * h_val
+
+            result_rows.append(
+                {"Tree": tree_val, "X": x_val, "Y": y_val, "DBH": dbh_val,
+                 "Species": sp_val, "Height": h_val, "CrownRadius": crown_val}
+            )
+
+    elif len(df.columns) >= 8:
+        # Positional fallback: Plot(0) Tag(1) SP(2) D(3) H(4) CR(5) X(6) Y(7)
+        for _, row in df.iterrows():
+            tree_val = to_float(row.iloc[1])
+            if not math.isfinite(tree_val):
+                tree_val = float(tree_enc.encode(str(row.iloc[1] or "")))
+
+            sp_val  = to_float_or_category(row.iloc[2], sp_enc)
+            dbh_val = to_float(row.iloc[3])
+            h_val   = to_float(row.iloc[4])
+            crown_val = to_float(row.iloc[5])
+            x_val   = to_float(row.iloc[6])
+            y_val   = to_float(row.iloc[7])
+
+            if not all(math.isfinite(v) for v in [x_val, y_val, dbh_val, h_val]):
+                continue
+
+            if not math.isfinite(crown_val) or crown_val <= 0:
+                # Empirical fallback: ~30 % of tree height is a typical crown radius
+                crown_val = 0.3 * h_val
+
+            result_rows.append(
+                {"Tree": tree_val, "X": x_val, "Y": y_val, "DBH": dbh_val,
+                 "Species": sp_val, "Height": h_val, "CrownRadius": crown_val}
+            )
+
+    else:
+        raise ValueError(
+            "无法识别列名/列顺序。支持: A) Tree/X/Y/DBH/Species/Height/[CrownRadius|CrownDiameter] "
+            "或 B) Plot/Tag/SP/D/H/CR/X/Y"
+        )
+
+    if not result_rows:
+        raise ValueError("标准化处理后没有有效数据行，请检查输入数据格式。")
+
+    result_df = pd.DataFrame(result_rows)
+    post_process_dbh_cm_to_m(result_df)
+    return result_df
+
+
+# ---------------------------------------------------------------------------
+# Buffer zone annotation
+# ---------------------------------------------------------------------------
+
+def add_bbox_zone_columns(df: pd.DataFrame, buffer_size: float) -> pd.DataFrame:
+    """Annotate each tree with distance-to-bounding-box-edge and CORE/BUFFER zone.
+
+    Parameters
+    ----------
+    df : DataFrame with at least X and Y columns.
+    buffer_size : edge width in metres (0 → all trees are CORE).
+    """
+    out = df.copy()
+    x = out["X"].to_numpy(dtype=float)
+    y = out["Y"].to_numpy(dtype=float)
+
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+
+    dist = np.minimum(
+        np.minimum(x - xmin, xmax - x),
+        np.minimum(y - ymin, ymax - y),
+    )
+
+    is_core = np.ones(len(out), dtype=bool) if buffer_size <= 0 else (dist >= buffer_size)
+    # buffer_size <= 0 treats zero and negative values as "no buffer" → all trees are CORE
+
+    out["BufferSize_m"]   = buffer_size
+    out["DistToBoundary"] = dist
+    out["IsCore"]         = is_core
+    out["Zone"]           = np.where(is_core, "CORE", "BUFFER")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunOptions:
+    """Options for the stand-metrics computation pipeline."""
+    use_wm: bool = True
+    use_layer: bool = True
+    use_uuci: bool = True
+    use_cf: bool = True
+    use_q: bool = True
+    export_main: bool = True
+    export_means: bool = True
+    export_entropy: bool = True
+    export_q_table: bool = True
+    buffer_size: float = 2.0
+    infl_k: float = 1.5
+
+
+@dataclass
+class PipelineResult:
+    """Return value of :func:`execute_pipeline`."""
+    standard_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    computed_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    main_preview: pd.DataFrame  = field(default_factory=pd.DataFrame)
+    means: pd.DataFrame         = field(default_factory=pd.DataFrame)
+    entropy: pd.DataFrame       = field(default_factory=pd.DataFrame)
+    q_table: pd.DataFrame       = field(default_factory=pd.DataFrame)
+    metric_list: list            = field(default_factory=list)
+    export_paths: ExportPaths   = field(default_factory=ExportPaths)
+
+
+def execute_pipeline(
+    source_df: pd.DataFrame,
+    input_path: str,
+    out_dir: str,
+    export_format: str,
+    options: RunOptions,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> PipelineResult:
+    """Run the full stand-metrics pipeline and return a :class:`PipelineResult`.
+
+    Parameters
+    ----------
+    source_df : raw input DataFrame (e.g. loaded from CSV / Excel).
+    input_path : original file path (used for naming export files).
+    out_dir : output directory; empty string → same folder as *input_path*.
+    export_format : ``"CSV"`` or ``"TXT"``.
+    options : computation and export flags.
+    progress_callback : optional ``(pct: int, msg: str) -> None`` callable.
+    """
+
+    def _progress(pct: int, msg: str = "") -> None:
+        if progress_callback is not None:
+            progress_callback(pct, msg)
+
+    _progress(10, "正在映射列名...")
+    standard = map_to_standard(source_df)
+
+    _progress(25, "正在标注缓冲区...")
+    standard = add_bbox_zone_columns(standard, options.buffer_size)
+
+    _progress(50, "正在计算结构参数...")
+    computed = compute_all(standard, options.infl_k)
+
+    entropy_df = pd.DataFrame({"Metric": [], "Weight": [], "Method": [], "Direction": []})
+    q_table_df = pd.DataFrame({"Tree": [], "Q": []})
+    q_all = float("nan")
+    q_core = float("nan")
+    q_buf = float("nan")
+
+    if options.use_q:
+        _progress(70, "正在计算熵权与综合质量指数...")
+        entropy_df, q_table_df, q_all, q_core, q_buf = compute_entropy_and_q(computed)
+
+    _progress(78, "正在计算林分均值...")
+    means_df = build_stand_means(computed, q_all, q_core, q_buf)
+
+    _progress(85, "正在生成主表预览...")
+    main_preview = build_main_for_preview(
+        computed,
+        use_wm=options.use_wm,
+        use_layer=options.use_layer,
+        use_uuci=options.use_uuci,
+        use_cf=options.use_cf,
+        use_q=options.use_q,
+    )
+
+    metric_list = build_metric_list(
+        use_wm=options.use_wm,
+        use_layer=options.use_layer,
+        use_uuci=options.use_uuci,
+        use_cf=options.use_cf,
+        use_q=options.use_q,
+    )
+
+    _progress(90, "正在导出结果文件...")
+    export_paths = write_all(
+        main_df=main_preview,
+        means_df=means_df,
+        entropy_df=entropy_df,
+        q_table_df=q_table_df,
+        input_path=input_path,
+        out_dir=out_dir,
+        export_format=export_format,
+        write_main=options.export_main,
+        write_means=options.export_means,
+        write_entropy=options.export_entropy,
+        write_q=options.export_q_table,
+    )
+
+    _progress(100, "完成。")
+    return PipelineResult(
+        standard_data=standard,
+        computed_data=computed,
+        main_preview=main_preview,
+        means=means_df,
+        entropy=entropy_df,
+        q_table=q_table_df,
+        metric_list=metric_list,
+        export_paths=export_paths,
+    )
 
