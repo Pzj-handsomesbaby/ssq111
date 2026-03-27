@@ -4,6 +4,16 @@ import os
 import sys
 
 # ==============================================================================
+# 🛡 OpenMP/MKL 冲突修复（必须在所有 C 扩展导入之前设置）
+# 退出码 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) 的根本原因：
+# Anaconda 环境中 NumPy/SciPy (MKL) 与 PyTorch 各自携带一份 libiomp5md.dll，
+# 多份 OpenMP 运行时同时加载时 Intel 运行时会调用 abort()。
+# KMP_DUPLICATE_LIB_OK=TRUE 允许多份共存从而消除崩溃。
+# ==============================================================================
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+# ==============================================================================
 # 🔥 深度环境修复：针对 WinError 127 强化路径搜索
 # ==============================================================================
 if os.name == 'nt':
